@@ -1,16 +1,16 @@
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr, validator
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import sqlite3
 import os
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 import csv
 import io
 from typing import Optional, List
 import re
+from contextlib import contextmanager
 
 load_dotenv()
 
@@ -23,18 +23,68 @@ allowed_origins = [url.strip() for url in frontend_urls.split(",")] if frontend_
 # CORS Configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,  # Supports multiple origins
+    allow_origins=allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Database connection
+# Database setup
+DATABASE_PATH = os.getenv("DATABASE_PATH", "waitlist.db")
+
+def init_db():
+    """Initialize the database with required tables"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    cursor = conn.cursor()
+    
+    # Subscribers table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            whatsapp TEXT NOT NULL UNIQUE,
+            email TEXT NOT NULL UNIQUE,
+            x_handle TEXT,
+            niche TEXT,
+            pro_tier_eligible BOOLEAN DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Admin activity logs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS admin_activity (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Message logs
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS message_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            subscriber_id INTEGER,
+            message_content TEXT,
+            status TEXT,
+            error_message TEXT,
+            sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (subscriber_id) REFERENCES subscribers(id)
+        )
+    """)
+    
+    conn.commit()
+    conn.close()
+
+# Initialize database on startup
+init_db()
+
+@contextmanager
 def get_db():
-    conn = psycopg2.connect(
-        os.getenv("DATABASE_URL"),
-        cursor_factory=RealDictCursor
-    )
+    """Database context manager"""
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row  # Return rows as dictionaries
     try:
         yield conn
     finally:
@@ -49,7 +99,6 @@ class SubscriberCreate(BaseModel):
 
     @validator('whatsapp')
     def validate_whatsapp(cls, v):
-        # Remove spaces, dashes, parentheses
         cleaned = re.sub(r'[\s\-\(\)]', '', v)
         if not re.match(r'^\+?[\d]{10,15}$', cleaned):
             raise ValueError('Invalid WhatsApp number format')
@@ -57,7 +106,7 @@ class SubscriberCreate(BaseModel):
 
 class BulkMessageRequest(BaseModel):
     message: str
-    subscriber_ids: Optional[List[int]] = None  # If None, send to all
+    subscriber_ids: Optional[List[int]] = None
 
 # Admin authentication
 def verify_admin_password(authorization: str = Header(None)):
@@ -71,6 +120,13 @@ def verify_admin_password(authorization: str = Header(None)):
     except:
         raise HTTPException(status_code=401, detail="Invalid authorization format")
 
+# Helper function to convert Row to dict
+def row_to_dict(row):
+    return dict(zip(row.keys(), row)) if row else None
+
+def rows_to_list(rows):
+    return [dict(zip(row.keys(), row)) for row in rows]
+
 # Routes
 @app.get("/")
 def root():
@@ -79,336 +135,347 @@ def root():
         "message": "Niche Finder Waitlist API",
         "status": "active",
         "environment": environment,
+        "database": "SQLite",
         "cors_origins": allowed_origins
     }
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint for Railway"""
+    """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.now().isoformat()}
 
 @app.post("/api/waitlist/subscribe")
-def subscribe_to_waitlist(subscriber: SubscriberCreate, conn = Depends(get_db)):
-    cursor = conn.cursor()
-    
-    try:
-        # Check if already exists
-        cursor.execute(
-            "SELECT id FROM subscribers WHERE email = %s OR whatsapp = %s",
-            (subscriber.email.lower(), subscriber.whatsapp)
-        )
+def subscribe_to_waitlist(subscriber: SubscriberCreate):
+    with get_db() as conn:
+        cursor = conn.cursor()
         
-        if cursor.fetchone():
-            raise HTTPException(status_code=409, detail="You're already on the waitlist!")
-        
-        # Determine pro tier eligibility
-        pro_tier = bool(subscriber.x_handle)
-        
-        # Insert subscriber
-        cursor.execute(
-            """
-            INSERT INTO subscribers (whatsapp, email, x_handle, niche, pro_tier_eligible, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                subscriber.whatsapp,
-                subscriber.email.lower(),
-                subscriber.x_handle,
-                subscriber.niche,
-                pro_tier,
-                datetime.now()
-            )
-        )
-        
-        subscriber_id = cursor.fetchone()['id']
-        conn.commit()
-        
-        # Log admin activity
-        cursor.execute(
-            "INSERT INTO admin_activity (action, details) VALUES (%s, %s)",
-            ("new_subscriber", f"New subscriber: {subscriber.email}")
-        )
-        conn.commit()
-        
-        return {
-            "success": True,
-            "message": "Successfully joined the waitlist!",
-            "pro_tier_eligible": pro_tier,
-            "subscriber_id": subscriber_id
-        }
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-
-@app.get("/api/admin/subscribers")
-def get_all_subscribers(conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(
-            """
-            SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
-                   created_at, updated_at
-            FROM subscribers
-            ORDER BY created_at DESC
-            """
-        )
-        
-        subscribers = cursor.fetchall()
-        
-        return {
-            "success": True,
-            "count": len(subscribers),
-            "subscribers": subscribers
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-
-@app.get("/api/admin/stats")
-def get_stats(conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        # Get all subscribers
-        cursor.execute(
-            """
-            SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
-                   created_at, updated_at
-            FROM subscribers
-            ORDER BY created_at DESC
-            """
-        )
-        subscribers = cursor.fetchall()
-        
-        # Total subscribers
-        total = len(subscribers)
-        
-        # Pro tier eligible
-        pro_tier = sum(1 for sub in subscribers if sub['pro_tier_eligible'])
-        
-        # Today's signups
-        today = sum(1 for sub in subscribers if sub['created_at'].date() == datetime.now().date())
-        
-        # This week's signups
-        week_ago = datetime.now() - datetime.timedelta(days=7)
-        week = sum(1 for sub in subscribers if sub['created_at'] >= week_ago)
-        
-        return {
-            "success": True,
-            "stats": {
-                "total_subscribers": total,
-                "pro_tier_eligible": pro_tier,
-                "signups_today": today,
-                "signups_this_week": week
-            },
-            "subscribers": subscribers  # Include full list for admin dashboard
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-
-@app.get("/api/admin/export/csv")
-def export_csv(conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(
-            """
-            SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
-                   created_at, updated_at
-            FROM subscribers
-            ORDER BY created_at DESC
-            """
-        )
-        
-        subscribers = cursor.fetchall()
-        
-        # Create CSV in memory
-        output = io.StringIO()
-        writer = csv.DictWriter(output, fieldnames=subscribers[0].keys() if subscribers else [])
-        writer.writeheader()
-        writer.writerows(subscribers)
-        
-        # Return as downloadable file
-        output.seek(0)
-        return StreamingResponse(
-            iter([output.getvalue()]),
-            media_type="text/csv",
-            headers={"Content-Disposition": f"attachment; filename=waitlist_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-
-@app.get("/api/admin/export/sql")
-def export_sql(conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute(
-            """
-            SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
-                   created_at, updated_at
-            FROM subscribers
-            ORDER BY created_at DESC
-            """
-        )
-        
-        subscribers = cursor.fetchall()
-        
-        # Generate SQL INSERT statements
-        sql_content = "-- Waitlist Subscribers Export\n"
-        sql_content += f"-- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        sql_content += "CREATE TABLE IF NOT EXISTS subscribers (\n"
-        sql_content += "    id SERIAL PRIMARY KEY,\n"
-        sql_content += "    whatsapp VARCHAR(20) NOT NULL,\n"
-        sql_content += "    email VARCHAR(255) NOT NULL,\n"
-        sql_content += "    x_handle VARCHAR(100),\n"
-        sql_content += "    niche TEXT,\n"
-        sql_content += "    pro_tier_eligible BOOLEAN DEFAULT FALSE,\n"
-        sql_content += "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n"
-        sql_content += "    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n"
-        sql_content += ");\n\n"
-        
-        for sub in subscribers:
-            x_handle_val = "NULL" if not sub['x_handle'] else f"'{sub['x_handle']}'"
-            niche_val = "NULL" if not sub['niche'] else f"'{sub['niche'].replace(chr(39), chr(39)+chr(39))}'"
-            
-            sql_content += f"INSERT INTO subscribers (id, whatsapp, email, x_handle, niche, pro_tier_eligible, created_at, updated_at) VALUES "
-            sql_content += f"({sub['id']}, '{sub['whatsapp']}', '{sub['email']}', "
-            sql_content += f"{x_handle_val}, "
-            sql_content += f"{niche_val}, "
-            sql_content += f"{sub['pro_tier_eligible']}, '{sub['created_at']}', '{sub['updated_at']}');\n"
-        
-        # Return as downloadable file
-        return StreamingResponse(
-            iter([sql_content]),
-            media_type="application/sql",
-            headers={"Content-Disposition": f"attachment; filename=waitlist_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"}
-        )
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
-
-@app.post("/api/admin/send-whatsapp")
-def send_bulk_whatsapp(request: BulkMessageRequest, conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        # Get subscribers to message
-        if request.subscriber_ids:
-            cursor.execute(
-                "SELECT id, whatsapp FROM subscribers WHERE id = ANY(%s)",
-                (request.subscriber_ids,)
-            )
-        else:
-            cursor.execute("SELECT id, whatsapp FROM subscribers")
-        
-        subscribers = cursor.fetchall()
-        
-        # Import Twilio (optional - install twilio package)
         try:
-            from twilio.rest import Client
-            
-            client = Client(
-                os.getenv("TWILIO_ACCOUNT_SID"),
-                os.getenv("TWILIO_AUTH_TOKEN")
+            # Check if already exists
+            cursor.execute(
+                "SELECT id FROM subscribers WHERE email = ? OR whatsapp = ?",
+                (subscriber.email.lower(), subscriber.whatsapp)
             )
             
-            success_count = 0
-            failed_count = 0
+            if cursor.fetchone():
+                raise HTTPException(status_code=409, detail="You're already on the waitlist!")
             
-            for sub in subscribers:
-                try:
-                    # Send WhatsApp message
-                    message = client.messages.create(
-                        from_=os.getenv("TWILIO_WHATSAPP_FROM"),
-                        body=request.message,
-                        to=f"whatsapp:{sub['whatsapp']}"
-                    )
-                    
-                    # Log success
-                    cursor.execute(
-                        """
-                        INSERT INTO message_logs (subscriber_id, message_content, status, sent_at)
-                        VALUES (%s, %s, %s, %s)
-                        """,
-                        (sub['id'], request.message, 'sent', datetime.now())
-                    )
-                    success_count += 1
-                    
-                except Exception as e:
-                    # Log failure
-                    cursor.execute(
-                        """
-                        INSERT INTO message_logs (subscriber_id, message_content, status, error_message, sent_at)
-                        VALUES (%s, %s, %s, %s, %s)
-                        """,
-                        (sub['id'], request.message, 'failed', str(e), datetime.now())
-                    )
-                    failed_count += 1
+            # Determine pro tier eligibility
+            pro_tier = 1 if subscriber.x_handle else 0
+            
+            # Insert subscriber
+            cursor.execute(
+                """
+                INSERT INTO subscribers (whatsapp, email, x_handle, niche, pro_tier_eligible, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    subscriber.whatsapp,
+                    subscriber.email.lower(),
+                    subscriber.x_handle,
+                    subscriber.niche,
+                    pro_tier,
+                    datetime.now(),
+                    datetime.now()
+                )
+            )
+            
+            subscriber_id = cursor.lastrowid
+            
+            # Log admin activity
+            cursor.execute(
+                "INSERT INTO admin_activity (action, details) VALUES (?, ?)",
+                ("new_subscriber", f"New subscriber: {subscriber.email}")
+            )
             
             conn.commit()
             
             return {
                 "success": True,
-                "message": f"Messages sent: {success_count} successful, {failed_count} failed",
-                "stats": {
-                    "total": len(subscribers),
-                    "success": success_count,
-                    "failed": failed_count
-                }
+                "message": "Successfully joined the waitlist!",
+                "pro_tier_eligible": bool(pro_tier),
+                "subscriber_id": subscriber_id
             }
             
-        except ImportError:
-            raise HTTPException(
-                status_code=500,
-                detail="Twilio not configured. Install 'twilio' package and set environment variables."
-            )
+        except HTTPException:
+            raise
+        except sqlite3.IntegrityError:
+            raise HTTPException(status_code=409, detail="Email or WhatsApp already registered!")
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/subscribers")
+def get_all_subscribers(_: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
         
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
+        try:
+            cursor.execute(
+                """
+                SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
+                       created_at, updated_at
+                FROM subscribers
+                ORDER BY created_at DESC
+                """
+            )
+            
+            subscribers = rows_to_list(cursor.fetchall())
+            
+            # Convert boolean values
+            for sub in subscribers:
+                sub['pro_tier_eligible'] = bool(sub['pro_tier_eligible'])
+            
+            return {
+                "success": True,
+                "count": len(subscribers),
+                "subscribers": subscribers
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/stats")
+def get_stats(_: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        try:
+            # Get all subscribers
+            cursor.execute(
+                """
+                SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
+                       created_at, updated_at
+                FROM subscribers
+                ORDER BY created_at DESC
+                """
+            )
+            subscribers = rows_to_list(cursor.fetchall())
+            
+            # Convert boolean values and parse dates
+            for sub in subscribers:
+                sub['pro_tier_eligible'] = bool(sub['pro_tier_eligible'])
+                # Parse created_at string to datetime
+                if isinstance(sub['created_at'], str):
+                    sub['created_at'] = datetime.fromisoformat(sub['created_at'])
+            
+            # Calculate stats
+            total = len(subscribers)
+            pro_tier = sum(1 for sub in subscribers if sub['pro_tier_eligible'])
+            
+            # Today's signups
+            today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            today = sum(1 for sub in subscribers if sub['created_at'] >= today_start)
+            
+            # This week's signups
+            week_ago = datetime.now() - timedelta(days=7)
+            week = sum(1 for sub in subscribers if sub['created_at'] >= week_ago)
+            
+            return {
+                "success": True,
+                "stats": {
+                    "total_subscribers": total,
+                    "pro_tier_eligible": pro_tier,
+                    "signups_today": today,
+                    "signups_this_week": week
+                },
+                "subscribers": subscribers
+            }
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/export/csv")
+def export_csv(_: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                """
+                SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
+                       created_at, updated_at
+                FROM subscribers
+                ORDER BY created_at DESC
+                """
+            )
+            
+            subscribers = rows_to_list(cursor.fetchall())
+            
+            if not subscribers:
+                raise HTTPException(status_code=404, detail="No subscribers to export")
+            
+            # Create CSV in memory
+            output = io.StringIO()
+            writer = csv.DictWriter(output, fieldnames=subscribers[0].keys())
+            writer.writeheader()
+            writer.writerows(subscribers)
+            
+            # Return as downloadable file
+            output.seek(0)
+            return StreamingResponse(
+                iter([output.getvalue()]),
+                media_type="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=waitlist_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"}
+            )
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/export/sql")
+def export_sql(_: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                """
+                SELECT id, whatsapp, email, x_handle, niche, pro_tier_eligible, 
+                       created_at, updated_at
+                FROM subscribers
+                ORDER BY created_at DESC
+                """
+            )
+            
+            subscribers = rows_to_list(cursor.fetchall())
+            
+            # Generate SQL INSERT statements
+            sql_content = "-- Waitlist Subscribers Export\n"
+            sql_content += f"-- Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            sql_content += "CREATE TABLE IF NOT EXISTS subscribers (\n"
+            sql_content += "    id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            sql_content += "    whatsapp TEXT NOT NULL,\n"
+            sql_content += "    email TEXT NOT NULL,\n"
+            sql_content += "    x_handle TEXT,\n"
+            sql_content += "    niche TEXT,\n"
+            sql_content += "    pro_tier_eligible BOOLEAN DEFAULT 0,\n"
+            sql_content += "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,\n"
+            sql_content += "    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP\n"
+            sql_content += ");\n\n"
+            
+            for sub in subscribers:
+                x_handle_val = "NULL" if not sub['x_handle'] else f"'{sub['x_handle']}'"
+                niche_val = "NULL" if not sub['niche'] else f"'{sub['niche'].replace(chr(39), chr(39)+chr(39))}'"
+                
+                sql_content += f"INSERT INTO subscribers (id, whatsapp, email, x_handle, niche, pro_tier_eligible, created_at, updated_at) VALUES "
+                sql_content += f"({sub['id']}, '{sub['whatsapp']}', '{sub['email']}', "
+                sql_content += f"{x_handle_val}, "
+                sql_content += f"{niche_val}, "
+                sql_content += f"{sub['pro_tier_eligible']}, '{sub['created_at']}', '{sub['updated_at']}');\n"
+            
+            # Return as downloadable file
+            return StreamingResponse(
+                iter([sql_content]),
+                media_type="application/sql",
+                headers={"Content-Disposition": f"attachment; filename=waitlist_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"}
+            )
+            
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/send-whatsapp")
+def send_bulk_whatsapp(request: BulkMessageRequest, _: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
+        
+        try:
+            # Get subscribers to message
+            if request.subscriber_ids:
+                placeholders = ','.join('?' * len(request.subscriber_ids))
+                cursor.execute(
+                    f"SELECT id, whatsapp FROM subscribers WHERE id IN ({placeholders})",
+                    request.subscriber_ids
+                )
+            else:
+                cursor.execute("SELECT id, whatsapp FROM subscribers")
+            
+            subscribers = rows_to_list(cursor.fetchall())
+            
+            # Import Twilio
+            try:
+                from twilio.rest import Client
+                
+                client = Client(
+                    os.getenv("TWILIO_ACCOUNT_SID"),
+                    os.getenv("TWILIO_AUTH_TOKEN")
+                )
+                
+                success_count = 0
+                failed_count = 0
+                
+                for sub in subscribers:
+                    try:
+                        # Send WhatsApp message
+                        message = client.messages.create(
+                            from_=os.getenv("TWILIO_WHATSAPP_FROM"),
+                            body=request.message,
+                            to=f"whatsapp:{sub['whatsapp']}"
+                        )
+                        
+                        # Log success
+                        cursor.execute(
+                            """
+                            INSERT INTO message_logs (subscriber_id, message_content, status, sent_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (sub['id'], request.message, 'sent', datetime.now())
+                        )
+                        success_count += 1
+                        
+                    except Exception as e:
+                        # Log failure
+                        cursor.execute(
+                            """
+                            INSERT INTO message_logs (subscriber_id, message_content, status, error_message, sent_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            """,
+                            (sub['id'], request.message, 'failed', str(e), datetime.now())
+                        )
+                        failed_count += 1
+                
+                conn.commit()
+                
+                return {
+                    "success": True,
+                    "message": f"Messages sent: {success_count} successful, {failed_count} failed",
+                    "stats": {
+                        "total": len(subscribers),
+                        "success": success_count,
+                        "failed": failed_count
+                    }
+                }
+                
+            except ImportError:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Twilio not configured. Install 'twilio' package and set environment variables."
+                )
+            
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/api/admin/subscribers/{subscriber_id}")
-def delete_subscriber(subscriber_id: int, conn = Depends(get_db), _: None = Depends(verify_admin_password)):
-    cursor = conn.cursor()
-    
-    try:
-        cursor.execute("DELETE FROM subscribers WHERE id = %s RETURNING id", (subscriber_id,))
-        deleted = cursor.fetchone()
+def delete_subscriber(subscriber_id: int, _: None = Depends(verify_admin_password)):
+    with get_db() as conn:
+        cursor = conn.cursor()
         
-        if not deleted:
-            raise HTTPException(status_code=404, detail="Subscriber not found")
-        
-        conn.commit()
-        
-        return {"success": True, "message": "Subscriber deleted successfully"}
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        conn.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        cursor.close()
+        try:
+            cursor.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
+            
+            if cursor.rowcount == 0:
+                raise HTTPException(status_code=404, detail="Subscriber not found")
+            
+            conn.commit()
+            
+            return {"success": True, "message": "Subscriber deleted successfully"}
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
