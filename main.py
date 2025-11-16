@@ -392,23 +392,32 @@ def send_bulk_whatsapp(request: BulkMessageRequest, _: None = Depends(verify_adm
             
             subscribers = rows_to_list(cursor.fetchall())
             
+            # Check if Twilio is configured
+            twilio_sid = os.getenv("TWILIO_ACCOUNT_SID")
+            twilio_token = os.getenv("TWILIO_AUTH_TOKEN")
+            twilio_from = os.getenv("TWILIO_WHATSAPP_FROM")
+            
+            if not all([twilio_sid, twilio_token, twilio_from]):
+                raise HTTPException(
+                    status_code=500,
+                    detail="Twilio not configured. Please set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_WHATSAPP_FROM environment variables."
+                )
+            
             # Import Twilio
             try:
                 from twilio.rest import Client
                 
-                client = Client(
-                    os.getenv("TWILIO_ACCOUNT_SID"),
-                    os.getenv("TWILIO_AUTH_TOKEN")
-                )
+                client = Client(twilio_sid, twilio_token)
                 
                 success_count = 0
                 failed_count = 0
+                error_messages = []
                 
                 for sub in subscribers:
                     try:
                         # Send WhatsApp message
                         message = client.messages.create(
-                            from_=os.getenv("TWILIO_WHATSAPP_FROM"),
+                            from_=twilio_from,
                             body=request.message,
                             to=f"whatsapp:{sub['whatsapp']}"
                         )
@@ -424,13 +433,16 @@ def send_bulk_whatsapp(request: BulkMessageRequest, _: None = Depends(verify_adm
                         success_count += 1
                         
                     except Exception as e:
+                        error_msg = str(e)
+                        error_messages.append(f"Failed to send to {sub['whatsapp']}: {error_msg}")
+                        
                         # Log failure
                         cursor.execute(
                             """
                             INSERT INTO message_logs (subscriber_id, message_content, status, error_message, sent_at)
                             VALUES (?, ?, ?, ?, ?)
                             """,
-                            (sub['id'], request.message, 'failed', str(e), datetime.now())
+                            (sub['id'], request.message, 'failed', error_msg, datetime.now())
                         )
                         failed_count += 1
                 
@@ -443,15 +455,18 @@ def send_bulk_whatsapp(request: BulkMessageRequest, _: None = Depends(verify_adm
                         "total": len(subscribers),
                         "success": success_count,
                         "failed": failed_count
-                    }
+                    },
+                    "errors": error_messages if error_messages else None
                 }
                 
             except ImportError:
                 raise HTTPException(
                     status_code=500,
-                    detail="Twilio not configured. Install 'twilio' package and set environment variables."
+                    detail="Twilio package not installed. Add 'twilio' to requirements.txt and redeploy."
                 )
             
+        except HTTPException:
+            raise
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=500, detail=str(e))
