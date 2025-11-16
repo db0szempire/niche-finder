@@ -97,7 +97,8 @@ class SubscriberCreate(BaseModel):
     x_handle: Optional[str] = None
     niche: Optional[str] = None
 
-    @validator('whatsapp')
+    @field_validator('whatsapp')
+    @classmethod
     def validate_whatsapp(cls, v):
         cleaned = re.sub(r'[\s\-\(\)]', '', v)
         if not re.match(r'^\+?[\d]{10,15}$', cleaned):
